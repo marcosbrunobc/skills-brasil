@@ -1,8 +1,11 @@
-"""Travas automáticas (hooks) do guardiao-da-memoria. Nunca bloqueiam: qualquer erro vai para o log e sai com código 0.
+"""Travas automáticas (hooks) do guardiao-da-memoria.
 
   vigia.py correcao   UserPromptSubmit: anota na fila a fala do dono que é pedido para lembrar, correção ou acerto
   vigia.py diario     PreCompact e SessionEnd: grava o diário da sessão (falas, recusas, erros, arquivos editados)
   vigia.py inicio     SessionStart: avisa da fila, da revisão vencida, do índice grande e dos erros já repetidos
+  vigia.py trava      PreToolUse: bloqueia (código 2) apagar, mover ou reescrever memória por fora do banco
+
+Erro interno nunca bloqueia: vai para o log e sai com código 0. Só a trava sai com 2, e só quando a regra é quebrada.
 
 Tudo fica em ~/.claude/memoria-recuperacao (para testes: $BANCO_CLAUDE_HOME/memoria-recuperacao).
 O banco.py importa este arquivo para ler a fila e o diário.
@@ -415,14 +418,644 @@ def inicio(e):
         print("\n".join(linhas))
 
 
+REGISTRO = os.path.join(BANCO, "registro.json")
+HORAS_VEREDITO = 3  # o veredito REMOVER libera reescrever aquela memória por algumas horas
+LIMITE_COMANDO = 500_000  # comando maior: analisa os primeiros 400 KB e os últimos 100 KB (o hook tem 10 s)
+LINK_INDICE = re.compile(r"\]\(([^)\s]{1,300}\.md)\)")
+CASA = os.path.expanduser("~")
+APAGAM = {"rm", "rmdir", "del", "erase", "rd", "unlink", "shred", "truncate", "remove-item", "ri", "clear-content", "clc"}
+MOVEM = {"mv", "move", "move-item", "mi", "ren", "rename", "rename-item", "rni"}
+COPIAM = {"cp", "copy", "copy-item", "cpi", "install", "ln", "rsync"}
+GRAVAM = {"set-content", "sc", "out-file", "new-item", "ni"}
+DESCOMPACTAM = {"tar", "unzip", "expand-archive"}
+LISTAM = {"ls", "dir", "gci", "get-childitem", "find", "fd", "rg", "grep"}
+MUDAM_DIR = {"cd", "pushd", "chdir", "set-location", "sl", "push-location"}
+PREFIXOS = {"sudo", "command", "builtin", "nohup", "time", "exec", "env", "&", "then", "do", "else", "elif", "!", "if",
+            "while", "until", "try", "catch", "finally", "elseif", "setsid"}
+ENVOLVEM = {"timeout", "nice", "ionice", "stdbuf", "busybox", "watch"}  # rodam outro comando: pula opções e números
+LACOS = {"foreach", "foreach-object", "%", "where-object", "?"}
+INTERPRETES = {"python", "python3", "py", "node", "perl", "ruby"}
+GIT_REESCREVE = {"checkout", "restore", "clean", "rm", "mv", "reset", "stash", "switch"}
+NOMEADOS = {"-path", "-literalpath", "-destination", "-destinationpath", "-t", "--target-directory", "-o", "--output",
+            "-filepath", "-value", "-c", "-d"}
+NET = re.compile(r"\[(?:system\.)?io\.(?:file|directory)\]::(?:delete|move|replace|copy|writeall\w{0,20})", re.I)
+PY_APAGA = re.compile(r"os\.(?:remove|unlink|rename|replace|rmdir)|shutil\.(?:move|rmtree|copy\w{0,10})|\.write_text|\.unlink\("
+                      r"|open\([^)\n]{0,200}['\"][wx]", re.I)
+JS_APAGA = re.compile(r"\b(?:unlink|rm|rmdir|rename|writeFile|copyFile)(?:Sync)?\(", re.I)
+VERBO_APAGA = re.compile(r"(?<![\w-])(remove-item|ri|rm|del|erase|move-item|mi|mv|set-content|clear-content|out-file)(?![\w-])", re.I)
+CITA_CLAUDE = re.compile(r"\.claude[\\/]+projects", re.I)
+PODE_TOCAR = re.compile(r"\.claude|projects|memory|users|\$home|\$\{home|\$userprofile|\$env:|%userprofile%|claude_config|~", re.I)
+NOME_MD = re.compile(r"\.md['\"]?$|^['\"]?\*['\"]?$|^['\"]?\*\.\*['\"]?$", re.I)  # filtro de find que pode pegar memória
+
+
+def _log(msg):
+    try:
+        os.makedirs(BANCO, exist_ok=True)
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} trava: {msg}\n")
+    except OSError:
+        pass
+
+
+def _normal(p):
+    p = re.sub(r"^\\\\\?\\", "", str(p))  # \\?\C:\... é o mesmo caminho
+    return os.path.normcase(os.path.normpath(p))
+
+
+def _memoria(caminho):
+    """(é memória, é o índice) para um caminho de arquivo, pela pasta real de memória do Claude Code."""
+    try:
+        caminho = re.sub(r"^\\\\\?\\", "", str(caminho))
+        real = os.path.normcase(os.path.realpath(caminho))
+        raiz = os.path.normcase(os.path.realpath(os.path.join(CLAUDE, "projects")))
+        partes = os.path.relpath(real, raiz).split(os.sep)
+    except (ValueError, TypeError):  # outro drive, caminho inválido
+        return False, False
+    if len(partes) != 3 or partes[0] == ".." or partes[1] != "memory" or not real.endswith(".md"):
+        return False, False
+    return True, partes[2] == os.path.normcase("MEMORY.md")
+
+
+def _cita_projects(texto):
+    """O texto cita a pasta projects do Claude Code (por ~/.claude/projects ou pelo caminho real)?"""
+    if CITA_CLAUDE.search(texto):
+        return True
+    raiz = _normal(os.path.join(CLAUDE, "projects")).replace("\\", "/")
+    return raiz in os.path.normcase(texto).replace("\\", "/").replace("//", "/")
+
+
+def _expandir(tok, cwd, vars_=None):
+    """Caminho absoluto normalizado de um argumento (~, $HOME, variáveis, /c/ do Git Bash, relativo ao cwd).
+
+    Termina em os.sep quando o argumento terminava em barra (pasta). None quando não dá para resolver."""
+    bruto = (tok or "").strip().strip("@(){};").strip("\"'")
+    bruto = re.sub(r"^\\\\\?\\", "", bruto)
+    if not bruto or bruto.startswith("-") or len(bruto) > 1000 or "\n" in bruto:
+        return None
+    t = bruto
+    for _ in range(3):  # $m pode valer "$HOME\..."; resolve em camadas
+        m = re.match(r"^(?:\$env:(\w+)|\$\{(\w+)\}|\$(\w+)|%(\w+)%)", t, re.I)
+        if not m:
+            break
+        nome = next(g for g in m.groups() if g)
+        if nome.lower() in ("_", "psitem"):
+            return None  # $_ do PowerShell é o item do pipeline, não variável de ambiente
+        if vars_ and nome in vars_:
+            valor = vars_[nome]
+        elif nome.upper() in ("HOME", "USERPROFILE"):
+            valor = CASA
+        else:
+            valor = os.environ.get(nome)
+        if valor is None:
+            return None  # variável que não sei resolver
+        t = valor + t[m.end():]
+    t = re.sub(r"^~(?=$|[\\/])", lambda m: CASA, t)
+    m = re.match(r"^/([a-zA-Z])(?=/|$)", t)
+    if m and os.name == "nt":
+        t = m.group(1) + ":" + t[2:]
+    if not os.path.isabs(t):
+        t = os.path.join(cwd, t)
+    pasta = re.search(r"[\\/]\.?$", bruto) is not None
+    return _normal(t) + (os.sep if pasta else "")
+
+
+def _partes(p):
+    """Partes do caminho dentro de CLAUDE/projects, ou None se estiver fora."""
+    raiz = _normal(os.path.join(CLAUDE, "projects"))
+    p = (p or "").rstrip("\\/")
+    if not p.startswith(raiz + os.sep):
+        return None
+    return p[len(raiz) + 1:].split(os.sep)
+
+
+def _toca_memoria(p):
+    """É uma memória, uma pasta de memória, um projeto inteiro, a pasta projects ou algo acima dela?"""
+    if not p:
+        return False
+    raiz = _normal(os.path.join(CLAUDE, "projects"))
+    if (raiz + os.sep).startswith(p.rstrip("\\/") + os.sep):
+        return True  # apagar projects, ~/.claude ou acima leva as memórias junto
+    partes = _partes(p)
+    return partes is not None and (len(partes) == 1 or partes[1] == "memory")
+
+
+def _dentro_da_memoria(p):
+    """Está na pasta de memória de um projeto (ou dentro dela)? Não conta as pastas acima."""
+    partes = _partes(p)
+    return partes is not None and len(partes) >= 2 and partes[1] == "memory"
+
+
+def _existe(p):
+    try:
+        return os.path.exists(p)
+    except (OSError, ValueError):
+        return False
+
+
+def _sobrescreve(alvo, fontes):
+    """Gravar em alvo apaga uma memória que já existe? Memória nova é livre."""
+    if not alvo or not _toca_memoria(alvo):
+        return False
+    if alvo.endswith(os.sep) or os.path.isdir(alvo):
+        if not fontes:
+            return True
+        for f in fontes:
+            if not f:
+                continue
+            if "*" in f or "?" in f or f.endswith(os.sep) or os.path.isdir(f) or os.path.basename(f) in (".", ""):
+                return True  # pasta ou glob copiada por cima pode trocar memórias que já existem
+            if _existe(os.path.join(alvo, os.path.basename(f))):
+                return True
+        return False
+    return _existe(alvo) or "*" in alvo
+
+
+def _sem_heredoc(texto):
+    """(texto sem o corpo de heredoc e de here-string, [(linha que abriu, corpo)]). O corpo é dado, não comando."""
+    saida, corpos, fim, abertura, corpo = [], [], None, "", []
+    for linha in texto.split("\n"):
+        if fim is not None:
+            if (fim in ("'@", '"@') and linha.lstrip().startswith(fim)) or linha.strip() == fim:
+                corpos.append((abertura, "\n".join(corpo)))
+                if fim in ("'@", '"@'):
+                    saida.append(linha.lstrip()[2:])  # o que vem depois do '@ ainda é comando
+                fim, corpo = None, []
+            else:
+                corpo.append(linha)
+            continue
+        saida.append(linha)
+        m = re.search(r"(?<!<)<<(?!<)-?\s*['\"]?([A-Za-z_][\w-]{0,40})['\"]?", linha)
+        if m:
+            fim, abertura = m.group(1), linha
+        elif re.search(r"@'\s*$", linha):
+            fim, abertura = "'@", linha
+        elif re.search(r'@"\s*$', linha):
+            fim, abertura = '"@', linha
+    if fim is not None:
+        corpos.append((abertura, "\n".join(corpo)))
+    return "\n".join(saida), corpos
+
+
+def _trechos(texto, bash):
+    """[[comando do pipeline, ...], ...]: separa por ; && || e quebra de linha, e o pipeline por |, fora de aspas.
+
+    No PowerShell, { e } também separam comandos, mas no mesmo pipeline (o bloco de um ForEach-Object segue a lista)."""
+    seqs, pipe, atual, aspas, i = [], [], [], None, 0
+    while i < len(texto):
+        c = texto[i]
+        if bash and c == "\\" and aspas != "'" and i + 1 < len(texto):
+            atual.append(texto[i:i + 2])  # caractere escapado no bash não abre aspas nem separa
+            i += 2
+            continue
+        if aspas:
+            aspas = None if c == aspas else aspas
+        elif c in "\"'":
+            aspas = c
+        elif texto.startswith(("&&", "||"), i) or c in ";\n":
+            pipe.append("".join(atual))
+            seqs.append(pipe)
+            pipe, atual = [], []
+            i += 2 if texto.startswith(("&&", "||"), i) else 1
+            continue
+        elif (c == "|" and not (i and texto[i - 1] == ">")) or (not bash and c in "{}"):  # >| é redirecionamento
+            pipe.append("".join(atual))
+            atual = []
+            i += 1
+            continue
+        atual.append(c)
+        i += 1
+    pipe.append("".join(atual))
+    seqs.append(pipe)
+    return seqs
+
+
+def _brutas(trecho):
+    return re.findall(r"\"[^\"]*\"|'[^']*'|[^\s\"']+(?:\"[^\"]*\"|'[^']*')?", trecho)
+
+
+def _palavras(trecho):
+    """Palavras do comando, sem aspas, parênteses e chaves das pontas, e sem os redirecionamentos."""
+    saida, pular = [], False
+    for w in _brutas(trecho):
+        if pular:
+            pular = False
+            continue
+        if re.fullmatch(r"(\d|&|\*)?>>?\|?|<", w):
+            pular = True
+            continue
+        if re.match(r"^((\d|&|\*)?>>?|<)", w):
+            continue
+        w = w.strip("@(){};")
+        if len(w) > 1 and w[0] == w[-1] and w[0] in "\"'":
+            w = w[1:-1]
+        if w:
+            saida.append(w)
+    return saida
+
+
+def _redirecionados(trecho):
+    """Alvos de > (e >|, &>, *>) fora de aspas; >> acrescenta e fica livre."""
+    toks = re.findall(r"\"[^\"]*\"|'[^']*'|[^\s\"']+", trecho)
+    for k, tok in enumerate(toks):
+        if tok[:1] in "\"'":
+            continue
+        m = re.search(r"(?<!>)(\d|&|\*)?>(?![>&])\|?(.*)$", tok)
+        if not m or (m.group(1) or "") not in ("", "1", "&", "*"):
+            continue
+        yield m.group(2) or (toks[k + 1] if k + 1 < len(toks) else "")
+
+
+def _verbo(palavra):
+    v = os.path.basename(palavra.replace("\\", "/")).lower()
+    return v[:-4] if v.endswith(".exe") else v
+
+
+def _origem_destino(resto, ex):
+    """(fontes, alvo, nomeados) de cp, mv, Copy-Item, Move-Item, dd, curl, tar e unzip."""
+    nomeados, pos, i = {}, [], 0
+    while i < len(resto):
+        a = resto[i]
+        al = a.lower()
+        if al in NOMEADOS:
+            if i + 1 < len(resto):
+                nomeados[al] = resto[i + 1]
+            i += 2
+            continue
+        if al.startswith("--target-directory="):
+            nomeados["-t"] = a.split("=", 1)[1]
+        elif al.startswith("of="):
+            nomeados["of"] = a[3:]
+        elif not a.startswith("-"):
+            pos.append(a)
+        i += 1
+    alvo = next((nomeados[k] for k in ("-destination", "-destinationpath", "-t", "--target-directory", "of", "-o",
+                                       "--output") if k in nomeados), None)
+    fontes = [nomeados[k] for k in ("-path", "-literalpath") if k in nomeados] + pos
+    if not alvo and len(fontes) >= 2:
+        alvo = fontes.pop()
+    return [ex(f) for f in fontes], (ex(alvo) if alvo else None), nomeados
+
+
+def _atribuicao(trecho, cwd, estado):
+    """D=valor (bash) ou $f = valor (PowerShell): guarda o valor. True se o trecho só atribui."""
+    m = re.match(r"^\s*\$(\w+)\s*=\s*(.+?)\s*$", trecho)  # PowerShell
+    pares = [(m.group(1), m.group(2))] if m else []
+    palavras = _brutas(trecho)
+    k = 0
+    while k < len(palavras) and re.match(r"^\w+=", palavras[k]):  # bash: só as atribuições do começo
+        pares.append(tuple(palavras[k].split("=", 1)))
+        k += 1
+    for nome, valor in pares:
+        limpo = valor.strip().strip("\"'")
+        if " " not in limpo and not limpo.startswith(("(", "$(")):
+            estado["vars"][nome] = limpo  # caminho literal: resolvido depois em $nome
+        elif any(_toca_memoria(_expandir(x, cwd, estado["vars"])) for x in _palavras(valor)):
+            estado["listas"].add(nome)  # $f = Get-ChildItem <memória>: a variável carrega memórias
+    return bool(m) or bool(palavras and k == len(palavras))
+
+
+def _comando(trecho, cwd, estado, lista_memoria, nivel, bash):
+    """(bloqueia, cwd depois do comando, o comando lista ou cita memória) para um comando simples."""
+    so_atribui = _atribuicao(trecho, cwd, estado)
+    var = estado["var_memoria"]
+
+    def ex(a):
+        return _expandir(a, cwd, estado["vars"])
+
+    for alvo in _redirecionados(trecho):
+        if _sobrescreve(ex(alvo), []) or ("$" in alvo and var):
+            return True, cwd, False
+    if so_atribui:
+        return False, cwd, False
+    args = _palavras(trecho)
+    while args:
+        primeiro = args[0].lower()
+        if primeiro in PREFIXOS or re.match(r"^\w+=", args[0]):
+            args = args[1:]
+        elif _verbo(args[0]) in ENVOLVEM:
+            args = args[1:]
+            while args and (args[0].startswith("-") or re.fullmatch(r"\d+[smhd]?", args[0])):
+                args = args[1:]
+        else:
+            break
+    if not args:
+        return False, cwd, False
+    if args[0].startswith("$") and args[0].lstrip("$").split(".")[0] in estado["listas"]:
+        return False, cwd, True  # $f | Remove-Item: $f carrega memórias
+    verbo = _verbo(args[0])
+    resto = args[1:]
+    caminhos = [p for p in (ex(a) for a in resto) if p]
+    cita = any(_toca_memoria(p) for p in caminhos)
+    usa_var = var and any("$" in a for a in resto)
+    posicionais = [a for a in resto if not a.startswith("-")]
+    if verbo in MUDAM_DIR:
+        destino = ex(posicionais[0]) if posicionais else _normal(CASA)
+        if verbo in ("pushd", "push-location"):
+            estado["pilha"].append(cwd)
+        return False, (destino or cwd).rstrip("\\/") or cwd, False
+    if verbo in ("popd", "pop-location"):
+        return False, (estado["pilha"].pop() if estado["pilha"] else cwd), False
+    if verbo == "eval" and nivel < 3:
+        return bool(_analisa(" ".join(resto), cwd, nivel + 1, bash, estado)), cwd, cita
+    if verbo == "for":  # bash: for f in <memória>; do rm $f; done
+        if "in" in resto and any(_toca_memoria(ex(a)) for a in resto[resto.index("in") + 1:]):
+            estado["var_memoria"] = True
+        return False, cwd, False
+    if verbo == "read" or (verbo == "while" and "read" in resto):
+        if lista_memoria:
+            estado["var_memoria"] = True  # ls <memória> | while read f; do rm "$f"
+        return False, cwd, False
+    if verbo in LACOS:
+        de_lista = any(a.lstrip("$").split(".")[0] in estado["listas"] for a in resto if a.startswith("$"))
+        if cita or de_lista or (lista_memoria and verbo == "foreach"):
+            estado["var_memoria"] = True  # foreach ($f in <memória>) { Remove-Item $f }: $f carrega memórias
+        return (lista_memoria or cita or var or de_lista) and bool(VERBO_APAGA.search(trecho)), cwd, cita or lista_memoria or de_lista
+    if (verbo in INTERPRETES or verbo.startswith("python3.")) and verbo not in ("perl", "ruby"):  # -i deles é com o sed
+        if verbo.startswith("py") and posicionais and _verbo(posicionais[0]) == "banco.py":
+            return False, cwd, False  # o banco é o caminho certo
+        codigo = any(a in ("-c", "-e") for a in resto)
+        cita_codigo = _cita_projects(trecho) or _dentro_da_memoria(cwd)
+        apaga = PY_APAGA.search(trecho[:20000]) or JS_APAGA.search(trecho[:20000])
+        return codigo and cita_codigo and bool(apaga), cwd, cita
+    if verbo in ("cmd", "bash", "sh", "zsh", "powershell", "pwsh") and nivel < 3:
+        interno_bash = verbo in ("bash", "sh", "zsh")
+        for j, a in enumerate(resto):
+            if a.lower() in ("/c", "-c", "-command") and j + 1 < len(resto):
+                return bool(_analisa(" ".join(resto[j + 1:]), cwd, nivel + 1, interno_bash)), cwd, cita
+        if verbo in ("powershell", "pwsh"):  # powershell Remove-Item X, sem -Command
+            sobra, j = [], 0
+            while j < len(resto):
+                if resto[j].lower() in ("-executionpolicy", "-windowstyle", "-file", "-encodedcommand"):
+                    j += 2
+                    continue
+                if not resto[j].startswith("-"):
+                    sobra.append(resto[j])
+                j += 1
+            return bool(sobra and _analisa(" ".join(sobra), cwd, nivel + 1, False)), cwd, cita
+        return False, cwd, cita
+    if NET.search(trecho) and (_cita_projects(trecho) or _dentro_da_memoria(cwd)):
+        return True, cwd, False
+    if verbo == "xargs":
+        sub = [a.lower() for a in posicionais]
+        no_lugar = any(re.match(r"^-[a-zA-Z]*i", a) or a.startswith("--in-place") for a in resto)
+        apaga = bool(sub) and (sub[0] in APAGAM | MOVEM or (sub[0] in ("sed", "perl") and no_lugar))
+        return apaga and lista_memoria, cwd, cita
+    if verbo == "find":
+        inicio = [ex(a) for a in resto[:next((k for k, a in enumerate(resto) if a.startswith(("-", "(", "!"))), len(resto))]]
+        inicio = [p for p in inicio if p] or [cwd]
+        negado = {k + 1 for k, a in enumerate(resto) if a in ("-not", "!")}
+        nomes = [resto[k + 1] for k, a in enumerate(resto) if a in ("-name", "-iname") and k + 1 < len(resto) and k not in negado]
+        # só um filtro positivo com extensão fixa que não é .md (*.jsonl, *.pyc) deixa a memória de fora
+        def seguro(n):
+            ext = re.search(r"\.([A-Za-z0-9]{1,10})['\"]?$", n)
+            return bool(ext) and ext.group(1).lower() != "md" and "*" not in n.split(".")[-1]
+        tem_ou = any(a in ("-o", "-or") for a in resto)
+        nome_negado = any(resto[k] in ("-name", "-iname") for k in negado if k < len(resto))
+        pode_ter_md = not nomes or tem_ou or nome_negado or not all(seguro(n) for n in nomes)
+        so_pastas_vazias = "-empty" in resto and "d" in [resto[k + 1] for k, a in enumerate(resto) if a == "-type" and k + 1 < len(resto)]
+        exclui = (any(a in ("-not", "!") and k + 2 < len(resto) and "memory" in resto[k + 2] for k, a in enumerate(resto))
+                  and not tem_ou) or so_pastas_vazias
+        profundidade = next((int(resto[k + 1]) for k, a in enumerate(resto) if a == "-maxdepth" and k + 1 < len(resto)
+                             and resto[k + 1].isdigit()), None)
+        raiz = _normal(os.path.join(CLAUDE, "projects"))
+
+        def ao_alcance(p):
+            if profundidade is None or not _toca_memoria(p):
+                return True
+            partes = _partes(p)
+            if partes is not None:
+                falta = 3 - len(partes)
+            else:
+                rel = os.path.relpath(raiz, p.rstrip("\\/") or os.sep)
+                falta = (0 if rel == "." else len(rel.split(os.sep))) + 3
+            return profundidade >= falta  # memória fica em projects/<projeto>/memory/<arquivo>
+        # pasta acima da memória (a home, projects): só conta se o filtro pode pegar um .md da memória
+        alcanca = any(_dentro_da_memoria(p) for p in inicio) or (
+            any(_toca_memoria(p) and ao_alcance(p) for p in inicio) and pode_ter_md and not exclui)
+        apaga = "-delete" in resto
+        for k, a in enumerate(resto):
+            if a in ("-exec", "-execdir") and k + 1 < len(resto):
+                sub = _verbo(resto[k + 1])
+                no_lugar = any(re.match(r"^-[a-zA-Z]*i", x) or x.startswith("--in-place") for x in resto[k + 2:])
+                apaga = apaga or sub in APAGAM | MOVEM or (sub in ("sed", "perl") and no_lugar)
+        return apaga and alcanca, cwd, alcanca
+    if verbo in LISTAM and not caminhos and _dentro_da_memoria(cwd):
+        return False, cwd, True  # cd <memória>; ls | xargs rm
+    item_do_pipe = any(re.match(r"^\$(_|psitem)\b", a, re.I) for a in resto)
+    if verbo in APAGAM:
+        return cita or usa_var or (lista_memoria and (not caminhos or item_do_pipe)), cwd, cita
+    if verbo in MOVEM:
+        fontes, alvo, _ = _origem_destino(resto, ex)
+        sai = any(_toca_memoria(f) for f in fontes if f)
+        return sai or _sobrescreve(alvo, fontes) or usa_var or (lista_memoria and not fontes), cwd, cita
+    if verbo in COPIAM or verbo in ("dd", "curl", "wget", "sort"):
+        fontes, alvo, _ = _origem_destino(resto, ex)
+        if verbo == "wget" and "-O" in resto and resto.index("-O") + 1 < len(resto):
+            alvo = ex(resto[resto.index("-O") + 1])
+        if verbo == "sort":
+            alvo = ex(next((resto[k + 1] for k, a in enumerate(resto) if a == "-o" and k + 1 < len(resto)), ""))
+            fontes = []
+        apaga_resto = verbo == "rsync" and any(a.startswith("--delete") for a in resto) and _toca_memoria(alvo)
+        alvo_var = usa_var and bool(posicionais) and "$" in posicionais[-1]
+        return apaga_resto or alvo_var or _sobrescreve(alvo, fontes), cwd, cita
+    if verbo in DESCOMPACTAM:
+        _, alvo, nomeados = _origem_destino(resto, ex)
+        destino = ex(nomeados.get("-c") or nomeados.get("-d") or nomeados.get("-destinationpath") or "") or cwd
+        extrai = verbo != "tar" or any(re.match(r"^-?[a-zA-Z]*x", a) or a == "--extract" for a in resto)
+        return extrai and _dentro_da_memoria(destino) or (extrai and destino != cwd and _toca_memoria(destino)), cwd, cita
+    if verbo == "tee":
+        if any(a in ("-a", "--append") for a in resto):
+            return False, cwd, cita
+        return usa_var or any(_sobrescreve(p, []) for p in caminhos), cwd, cita
+    if verbo in GRAVAM:
+        baixo = [a.lower() for a in resto]
+        if "-append" in baixo or (verbo in ("new-item", "ni") and "-force" not in baixo):
+            return False, cwd, cita
+        nomeado = next((resto[k + 1] for k, a in enumerate(baixo) if a in ("-path", "-literalpath", "-filepath") and k + 1 < len(resto)), None)
+        alvo_bruto = nomeado or (posicionais[0] if posicionais else "")
+        return _sobrescreve(ex(alvo_bruto), []) or ("$" in alvo_bruto and var), cwd, cita
+    if verbo in ("sed", "perl", "ruby", "awk", "gawk"):
+        no_lugar = (any(re.match(r"^-[a-zA-Z]*i", a) or a.startswith("--in-place") for a in resto)
+                    or (verbo in ("awk", "gawk") and "inplace" in resto))
+        return no_lugar and (usa_var or any(_sobrescreve(p, []) for p in caminhos)), cwd, cita
+    if verbo == "git":
+        pasta, j = cwd, 0
+        while j < len(resto) and resto[j].startswith("-"):
+            if resto[j] == "-C" and j + 1 < len(resto):
+                pasta = ex(resto[j + 1]) or cwd
+                j += 1
+            j += 1
+        sub = resto[j].lower() if j < len(resto) else ""
+        if sub not in GIT_REESCREVE:
+            return False, cwd, cita
+        # caminhos do git são relativos à pasta do repositório (-C), não ao cwd
+        alvos = [p for p in (_expandir(a, pasta, estado["vars"]) for a in resto[j + 1:] if not a.startswith("-")) if p]
+        dentro_do_claude = _normal(pasta).startswith(_normal(CLAUDE))
+        # fora do ~/.claude (a home) só conta caminho que cai na memória; dentro dele, qualquer repositório que a contenha
+        return (_dentro_da_memoria(pasta) or any(_dentro_da_memoria(p) for p in alvos)
+                or (dentro_do_claude and (_toca_memoria(pasta) or any(_toca_memoria(p) for p in alvos)))), cwd, cita
+    return False, cwd, cita
+
+
+def _corpo_apaga(abertura, corpo, cwd, nivel, estado):
+    """O corpo de um heredoc dado a um interpretador apaga ou reescreve memória?"""
+    palavras = _palavras(abertura)
+    while palavras and (palavras[0].lower() in PREFIXOS or re.match(r"^\w+=", palavras[0])):
+        palavras = palavras[1:]
+    if not palavras or nivel >= 3:
+        return False
+    verbo = _verbo(palavras[0])
+    if verbo in ("bash", "sh", "zsh"):
+        return bool(_analisa(corpo, cwd, nivel + 1, True, estado))
+    if verbo in ("pwsh", "powershell"):
+        return bool(_analisa(corpo, cwd, nivel + 1, False, estado))
+    if verbo in INTERPRETES or verbo.startswith("python3."):
+        cita = _cita_projects(corpo) or _dentro_da_memoria(cwd)
+        return cita and bool(PY_APAGA.search(corpo[:50000]) or JS_APAGA.search(corpo[:50000]))
+    return False
+
+
+def _analisa(texto, cwd, nivel=0, bash=True, estado=None):
+    """O trecho do comando que apaga, move ou sobrescreve memória por fora do banco, ou None."""
+    if estado is None:
+        estado = {"pilha": [], "var_memoria": False, "vars": {}, "listas": set()}
+    if len(texto) > LIMITE_COMANDO:
+        texto = texto[:400_000] + "\n" + texto[-100_000:]
+    texto = texto.replace("\\\n" if bash else "`\n", " ")  # continuação de linha
+    texto, corpos = _sem_heredoc(texto)
+    for abertura, corpo in corpos:
+        if _corpo_apaga(abertura, corpo, cwd, nivel, estado):
+            return abertura.strip()[:200] or "heredoc"
+    for sub in re.findall(r"<\(([^()]{0,2000})\)", texto):  # done < <(ls <memória>): a lista vem depois do laço
+        if any(_toca_memoria(_expandir(a, cwd, estado["vars"])) for a in _palavras(sub)):
+            estado["var_memoria"] = True
+    if nivel < 3:  # $(...) e crase: comando dentro de comando
+        for sub in re.findall(r"\$\(([^()]{0,2000})\)", texto) + (re.findall(r"`([^`\n]{0,2000})`", texto) if bash else []):
+            achou = _analisa(sub, cwd, nivel + 1, bash, estado)
+            if achou:
+                return achou
+    for seq in _trechos(texto, bash):
+        lista_memoria = False
+        for trecho in seq:
+            bloqueia, cwd, cita = _comando(trecho, cwd, estado, lista_memoria, nivel, bash)
+            if bloqueia:
+                return trecho.strip()[:200] or "comando"
+            lista_memoria = lista_memoria or cita
+    return None
+
+
+def _comando_apaga_memoria(comando, cwd, bash=True):
+    cwd = str(cwd or "") or os.getcwd()
+    dentro = _toca_memoria(_normal(cwd)) or _normal(cwd).startswith(_normal(CLAUDE) + os.sep)
+    if not dentro and not PODE_TOCAR.search(comando[:LIMITE_COMANDO]):
+        return None  # caminho rápido: o comando nem cita a pasta do Claude
+    return _analisa(comando, _normal(cwd), 0, bash)
+
+
+def _veredito_recente(caminho):
+    """(há veredito REMOVER recente para este arquivo, o registro do banco está legível)."""
+    try:
+        with open(REGISTRO, encoding="utf-8") as f:
+            reg = json.load(f)
+        if not isinstance(reg, dict):
+            raise ValueError("registro não é um objeto")
+    except FileNotFoundError:
+        return False, True
+    except (OSError, ValueError) as erro:
+        _log(f"registro.json ilegível: {erro}")
+        return False, False
+    alvo = os.path.normcase(os.path.realpath(caminho))
+    limite = (datetime.datetime.now() - datetime.timedelta(hours=HORAS_VEREDITO)).strftime("%Y-%m-%d %H:%M:%S")
+    for ent in reg.values():
+        if (isinstance(ent, dict) and ent.get("status") == "remover" and ent.get("historico")
+                and os.path.normcase(os.path.realpath(ent.get("origem", ""))) == alvo and ent["historico"][-1][0] >= limite):
+            return True, True
+    return False, True
+
+
+def _ler(caminho):
+    """Texto do arquivo (UTF-8, com ou sem BOM), ou None se não der para ler com segurança."""
+    try:
+        with open(caminho, "rb") as f:
+            return f.read().decode("utf-8-sig")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _mantem_linhas(antigo, novo):
+    """Toda linha do texto antigo continua no novo, na mesma ordem (pode crescer no fim ou ganhar linhas no meio)."""
+    restantes = iter(l.strip() for l in novo.splitlines())
+    return all(any(l in n for n in restantes) for l in (x.strip() for x in antigo.splitlines()) if l)
+
+
+def _negar(motivo):
+    """Código 2 no PreToolUse bloqueia a ferramenta e mostra o stderr ao Claude."""
+    sys.stderr.write(
+        f"guardiao-da-memoria bloqueou: {motivo}. Para apagar ou reescrever uma memória, use o banco de recuperação: "
+        "banco.py guardar <arquivo> --motivo --prova; um conferente novo; banco.py veredito <id> REMOVER --prova "
+        "--conferente; então banco.py apagar <id> ou edite. Acrescentar texto sem tirar nada é livre.\n")
+    sys.exit(2)
+
+
+def trava(e):
+    """PreToolUse: memória só sai ou muda pelo banco; criar e acrescentar são livres. Em dúvida, deixa passar."""
+    ferramenta = e.get("tool_name") or ""
+    entrada = e.get("tool_input") or {}
+    if not isinstance(entrada, dict):
+        return
+    if ferramenta in ("Bash", "PowerShell"):
+        trecho = _comando_apaga_memoria(str(entrada.get("command") or ""), e.get("cwd"), ferramenta == "Bash")
+        if trecho:
+            _negar(f"o comando mexe em memória por fora do banco ({trecho[:120]})")
+        return
+    if ferramenta not in ("Write", "Edit", "MultiEdit"):
+        return
+    caminho = re.sub(r"^\\\\\?\\", "", str(entrada.get("file_path") or ""))
+    eh_memoria, indice = _memoria(caminho)
+    if not eh_memoria or not os.path.exists(caminho):
+        return  # memória nova não passa pelo banco
+    atual = _ler(caminho)
+    if atual is None:
+        _log(f"não consegui ler {caminho} como UTF-8; deixei passar")
+        return
+    atual = atual.replace("\r\n", "\n")
+    edicoes = [] if ferramenta == "Write" else (entrada.get("edits") or [entrada])
+    pares = [(str(ed.get("old_string") or "").replace("\r\n", "\n"), str(ed.get("new_string") or "").replace("\r\n", "\n"))
+             for ed in edicoes if isinstance(ed, dict)]
+    if indice:
+        links_perdidos, novo = False, atual
+        if ferramenta == "Write":
+            novo = str(entrada.get("content") or "")
+        for (velho, troca), ed in zip(pares, edicoes):
+            if velho not in novo:  # não achei o trecho: julgo pelos links do próprio trecho
+                links_perdidos = links_perdidos or not set(LINK_INDICE.findall(velho)) <= set(LINK_INDICE.findall(troca))
+                continue
+            novo = novo.replace(velho, troca) if ed.get("replace_all") else novo.replace(velho, troca, 1)
+        if links_perdidos or not set(LINK_INDICE.findall(atual)) <= set(LINK_INDICE.findall(novo)):
+            _negar("isso tira ou troca um link do MEMORY.md")
+        return
+    if ferramenta == "Write":
+        if _mantem_linhas(atual, str(entrada.get("content") or "")):
+            return
+    elif pares and all(velho in troca for velho, troca in pares):
+        return  # Edit que só acrescenta: o texto novo contém o antigo
+    recente, legivel = _veredito_recente(caminho)
+    if recente:
+        return
+    if not legivel:
+        _negar("o registro do banco (registro.json) está ilegível; conserte o banco antes de reescrever memória")
+    _negar(f"isso tira ou troca texto de {os.path.basename(caminho)} sem veredito REMOVER recente no banco")
+
+
 def principal():
     try:
         sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
         bruto = sys.stdin.buffer.read().decode("utf-8", "replace")
         e = json.loads(bruto) if bruto.strip() else {}
         if not isinstance(e, dict):
             raise ValueError("entrada do hook não é um objeto JSON")
-        {"correcao": correcao, "diario": diario, "inicio": inicio}[sys.argv[1]](e)
+        {"correcao": correcao, "diario": diario, "inicio": inicio, "trava": trava}[sys.argv[1]](e)
     except Exception:
         try:
             os.makedirs(BANCO, exist_ok=True)

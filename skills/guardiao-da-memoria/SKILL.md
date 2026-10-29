@@ -46,7 +46,12 @@ Nenhuma memória é apagada ou reescrita sem uma cópia antes, e quem achou o pr
    - NAO_VERIFICAVEL: não mexa. Leve ao dono como "CONFERIR" na revisão semanal das memórias.
 4. **Recuperar.** `banco.py listar` mostra o que está no banco. `banco.py restaurar <id>` devolve a memória e a linha do índice (no fim do índice). Se a memória atual for diferente, o script guarda essa versão antes de restaurar.
 
-O script recusa apagar sem o veredito REMOVER, recusa veredito sem prova ou de conferente fora da lista, guarda a versão atual se ela mudou depois de guardada e só aceita arquivos de `~/.claude/projects/<projeto>/memory/`. O script não sabe se o conferente foi mesmo outro agente, nem impede um `rm` ou um Write feito por fora dele: essa parte depende de você seguir esta skill. Uma memória nova, que não substitui nenhuma, não passa pelo banco. Para só acrescentar informação a uma memória, sem tirar nem mudar nada do que ela já dizia, rode `guardar ... --acrescimo` e edite: fica a cópia de segurança, sem conferente.
+O script recusa apagar sem o veredito REMOVER, recusa veredito sem prova ou de conferente fora da lista, guarda a versão atual se ela mudou depois de guardada e só aceita arquivos de `~/.claude/projects/<projeto>/memory/`. Com a trava instalada (hook PreToolUse `vigia.py trava`, opcional), mexer em memória por fora do banco é bloqueado:
+- Write e Edit numa memória que já existe só passam se acrescentam texto sem tirar nada (no `MEMORY.md`, se não tiram nenhum link) ou se há veredito REMOVER das últimas 3 horas para aquele arquivo;
+- comando de Bash ou PowerShell que apaga, move ou sobrescreve uma memória que já existe (ou o projeto inteiro) só passa se for do `banco.py`. Ler, procurar e criar memória nova por comando continuam livres, e na pasta acima da memória (a home) o `git` e o `find` com filtro que não pega `.md` também.
+
+Se a trava bloquear você, siga o banco: não tente outro caminho. Ela pega o uso comum, não um script feito para driblá-la, e não sabe se o conferente foi mesmo outro agente. Sem a trava, isso tudo depende de você seguir esta skill.
+ Uma memória nova, que não substitui nenhuma, não passa pelo banco. Para só acrescentar informação a uma memória, sem tirar nem mudar nada do que ela já dizia, rode `guardar ... --acrescimo` e edite: fica a cópia de segurança, sem conferente.
 
 ## Fila de correções e diário
 

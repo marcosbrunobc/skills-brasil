@@ -336,6 +336,267 @@ novo = [n for n in set(os.listdir(D)) - antes if n.endswith(".md")]
 txt = open(os.path.join(D, novo[0]), encoding="utf-8").read() if novo else ""
 ok("C:/proj/app.py" in txt and "scratchpad" not in txt, "rascunho da sessão fica fora de Arquivos editados")
 
+# 10. trava: memória só sai ou muda pelo banco
+def travar(entrada, cwd=CWD):
+    r = subprocess.run([sys.executable, os.path.join(SCRIPTS, "vigia.py"), "trava"], capture_output=True, cwd=CWD, timeout=20,
+                       input=json.dumps(dict(entrada, cwd=cwd)).encode("utf-8"), env=ENV)
+    return r.returncode, r.stderr.decode("utf-8")
+alvo = os.path.join(MEM, "alvo.md")
+with open(alvo, "w", encoding="utf-8") as f:
+    f.write("---\nname: alvo\n---\n\nlinha um\nlinha dois\n")
+indice = os.path.join(MEM, "MEMORY.md")
+with open(indice, "w", encoding="utf-8") as f:
+    f.write("- [Alvo](alvo.md) — gancho\n- [Cor](cor-a.md) — cor\n")
+casos = [
+    ("Edit que acrescenta", {"tool_name": "Edit", "tool_input": {"file_path": alvo, "old_string": "linha um", "new_string": "linha um\nlinha nova"}}, 0),
+    ("Edit que troca texto", {"tool_name": "Edit", "tool_input": {"file_path": alvo, "old_string": "linha um", "new_string": "linha 1"}}, 2),
+    ("MultiEdit com uma troca", {"tool_name": "MultiEdit", "tool_input": {"file_path": alvo, "edits": [
+        {"old_string": "linha um", "new_string": "linha um!"}, {"old_string": "linha dois", "new_string": "x"}]}}, 2),
+    ("Write de memória nova", {"tool_name": "Write", "tool_input": {"file_path": os.path.join(MEM, "nova.md"), "content": "x"}}, 0),
+    ("Write que perde linha", {"tool_name": "Write", "tool_input": {"file_path": alvo, "content": "---\nname: alvo\n---\n\nlinha um\n"}}, 2),
+    ("Write que só acrescenta", {"tool_name": "Write", "tool_input": {"file_path": alvo, "content": "---\nname: alvo\n---\n\nlinha um\nlinha dois\nlinha três\n"}}, 0),
+    ("índice perde link", {"tool_name": "Edit", "tool_input": {"file_path": indice, "old_string": "- [Cor](cor-a.md) — cor\n", "new_string": ""}}, 2),
+    ("índice muda texto, mantém link", {"tool_name": "Edit", "tool_input": {"file_path": indice, "old_string": "— cor", "new_string": "— cores da marca"}}, 0),
+    ("Edit fora da memória", {"tool_name": "Edit", "tool_input": {"file_path": os.path.join(SBX, "x.md"), "old_string": "a", "new_string": "b"}}, 0),
+    ("Read não é com ela", {"tool_name": "Read", "tool_input": {"file_path": alvo}}, 0),
+    ("rm na memória", {"tool_name": "Bash", "tool_input": {"command": f'rm "{alvo}"'}}, 2),
+    ("rm -rf na pasta", {"tool_name": "Bash", "tool_input": {"command": f'rm -rf "{MEM}"'}}, 2),
+    ("mv da memória", {"tool_name": "Bash", "tool_input": {"command": f'mv "{alvo}" /tmp/x.md'}}, 2),
+    ("sed -i no índice", {"tool_name": "Bash", "tool_input": {"command": f"sed -i 's/a/b/' \"{indice}\""}}, 2),
+    ("> sobrescreve", {"tool_name": "Bash", "tool_input": {"command": f'echo x > "{alvo}"'}}, 2),
+    (">> acrescenta", {"tool_name": "Bash", "tool_input": {"command": f'echo x >> "{alvo}"'}}, 0),
+    ("find -delete", {"tool_name": "Bash", "tool_input": {"command": f'find "{MEM}" -name "*.md" -delete'}}, 2),
+    ("python os.remove", {"tool_name": "Bash", "tool_input": {"command": f"python -c \"import os; os.remove(r'{alvo}')\""}}, 2),
+    ("cat para fora", {"tool_name": "Bash", "tool_input": {"command": f'cat "{alvo}" > /tmp/copia.md 2>/dev/null'}}, 0),
+    ("grep -ri na memória", {"tool_name": "Bash", "tool_input": {"command": f'grep -ri "linha" "{MEM}" 2>&1 | head'}}, 0),
+    ("banco.py apagar", {"tool_name": "Bash", "tool_input": {"command": f'python banco.py guardar "{alvo}" --motivo m --prova p'}}, 0),
+    ("banco e rm juntos", {"tool_name": "Bash", "tool_input": {"command": f'python banco.py listar; rm "{alvo}"'}}, 2),
+    ("Remove-Item no PowerShell", {"tool_name": "PowerShell", "tool_input": {"command": f'Remove-Item "{alvo}"'}}, 2),
+    ("cp por cima da memória", {"tool_name": "Bash", "tool_input": {"command": f'cp /tmp/x.md "{alvo}"'}}, 2),
+]
+for nome, entrada, esperado in casos:
+    rc, err = travar(entrada)
+    ok(rc == esperado and (("bloqueou" in err) == (esperado == 2)), f"trava: {nome} -> {esperado} (deu {rc})")
+rc, err = travar({"tool_name": "Bash", "tool_input": {"command": "rm alvo.md"}}, cwd=MEM)
+ok(rc == 2, "trava: rm relativo de dentro da pasta de memória")
+r = subprocess.run([sys.executable, os.path.join(SCRIPTS, "vigia.py"), "trava"], capture_output=True, cwd=CWD, timeout=20, input=b"[1,2]", env=ENV)
+ok(r.returncode == 0, "trava: entrada estranha deixa passar")
+rc, out = banco("guardar", alvo, "--motivo", "trocar linha um", "--prova", "teste")
+ident = out.strip().splitlines()[-1]
+banco("veredito", ident, "REMOVER", "--prova", "teste", "--conferente", "haiku")
+rc, err = travar({"tool_name": "Edit", "tool_input": {"file_path": alvo, "old_string": "linha um", "new_string": "linha 1"}})
+ok(rc == 0, "trava: com veredito REMOVER recente, a troca passa")
+t0 = time.time()
+travar({"tool_name": "Bash", "tool_input": {"command": "git status"}})
+ok(time.time() - t0 < 2, f"trava rápida num comando comum ({time.time() - t0:.2f} s)")
+
+# 11. trava v2: casos da revisão de 29/10 (bloqueio falso tem de passar; brecha comum tem de bloquear)
+GB = "/" + MEM[0].lower() + MEM[2:].replace("\\", "/")  # a mesma pasta no formato do Git Bash
+PROJ_DIR = os.path.dirname(MEM)
+passam = [
+    ("echo com rm no texto", "Bash", f'echo "ver {alvo} - rm depois"'),
+    ("git commit com mv na mensagem", "Bash", f'git commit -m "docs: mv {alvo} note"'),
+    ("grep pela palavra rm", "Bash", f'grep -rn rm "{MEM}"'),
+    ("heredoc com rm no corpo", "Bash", f"cat > /tmp/nota.txt <<'EOF'\napague com rm {alvo}\nEOF"),
+    ("pasta projects/x/memory fora do Claude", "Bash", "rm -rf /c/dev/projects/app/memory/cache.tmp"),
+    ("echo > memória nova", "Bash", f'echo hi > "{MEM}/novo-bash.md"'),
+    ("heredoc criando memória nova", "Bash", f"cat > \"{MEM}/novo-heredoc.md\" <<'EOF'\nx\nEOF"),
+    ("cp de arquivo novo para a pasta", "Bash", f'cp /tmp/inexistente-xyz.md "{MEM}/"'),
+    ("Set-Content em outro lugar lendo a memória", "PowerShell", f'Set-Content -Path C:\\t.txt -Value (Get-Content "{alvo}")'),
+    ("banco.py com caminho", "Bash", f'python "C:/x/banco.py" guardar "{alvo}" --motivo m --prova p'),
+]
+bloqueiam = [
+    ("cd na pasta e rm relativo", "Bash", f'cd "{MEM}" && rm alvo.md'),
+    ("pushd e rm", "Bash", f'pushd "{MEM}" && rm alvo.md'),
+    ("Set-Location e Remove-Item", "PowerShell", f'Set-Location "{MEM}"; Remove-Item alvo.md'),
+    ("pipeline Get-ChildItem | Remove-Item", "PowerShell", f'Get-ChildItem "{MEM}" | Remove-Item'),
+    ("[IO.File]::Delete", "PowerShell", f'[IO.File]::Delete("{alvo}")'),
+    ("Copy-Item -Force por cima", "PowerShell", f'Copy-Item C:\\x.md "{alvo}" -Force'),
+    ("Copy-Item -Destination", "PowerShell", f'Copy-Item -Destination "{alvo}" -Path C:\\x.md'),
+    ("New-Item -Force", "PowerShell", f'New-Item -Force -Path "{alvo}" -Value x'),
+    ("rd -Recurse", "PowerShell", f'rd "{MEM}" -Recurse'),
+    ("cmd /c del", "Bash", f'cmd /c "del {alvo}"'),
+    ("cp -f no formato Git Bash", "Bash", f"cp -f /tmp/x.md {GB}/alvo.md 2>&1"),
+    ("install por cima", "Bash", f'install /tmp/x.md "{alvo}"'),
+    ("rsync --delete", "Bash", f'rsync -a --delete /tmp/e/ "{MEM}/"'),
+    ("git checkout --", "Bash", f'git -C "{MEM}" checkout -- alvo.md'),
+    ("dd of=", "Bash", f'dd if=/tmp/x of="{alvo}"'),
+    ("perl -pi", "Bash", f"perl -pi -e 's/a/b/' \"{alvo}\""),
+    ("sed --in-place", "Bash", f"sed --in-place 's/a/b/' \"{alvo}\""),
+    ("curl -o", "Bash", f'curl -o "{alvo}" https://x.io/a'),
+    ("ln -sf", "Bash", f'ln -sf /tmp/x "{alvo}"'),
+    ("ls | xargs rm", "Bash", f'ls "{MEM}"/*.md | xargs rm'),
+    ("rm do projeto inteiro", "Bash", f'rm -rf "{PROJ_DIR}"'),
+    ("rm da pasta projects", "Bash", f'rm -rf "{os.path.dirname(PROJ_DIR)}"'),
+    ("barras duplas", "Bash", "rm " + alvo.replace("\\", "\\\\")),
+    ("banco.py só no comentário", "Bash", f'rm "{alvo}" # banco.py'),
+    ("find -exec rm", "Bash", f'find "{MEM}" -name "*.md" -exec rm {{}} \\;'),
+]
+for nome, ferramenta, comando in passam:
+    rc, err = travar({"tool_name": ferramenta, "tool_input": {"command": comando}})
+    ok(rc == 0, f"trava v2 deixa passar: {nome} (deu {rc}) {err[:80]}")
+for nome, ferramenta, comando in bloqueiam:
+    rc, err = travar({"tool_name": ferramenta, "tool_input": {"command": comando}})
+    ok(rc == 2, f"trava v2 bloqueia: {nome} (deu {rc})")
+rc, err = travar({"tool_name": "Bash", "tool_input": {"command": "ls > /tmp/lista.txt"}}, cwd=MEM)
+ok(rc == 0, "trava v2 deixa passar: ls > fora, de dentro da pasta de memória")
+rc, err = travar({"tool_name": "Edit", "tool_input": {"file_path": indice, "old_string": "(alvo.md)", "new_string": "(Alvo2.md)"}})
+ok(rc == 2, "trava v2 bloqueia: Edit que troca o destino de um link do índice")
+bom = os.path.join(MEM, "bom.md")
+with open(bom, "wb") as f:
+    f.write("\ufeffumа linha\n".encode("utf-8"))
+rc, err = travar({"tool_name": "Write", "tool_input": {"file_path": bom, "content": "umа linha\nmais uma\n"}})
+ok(rc == 0, "trava v2: memória com BOM aceita Write que só acrescenta")
+lat = os.path.join(MEM, "latin.md")
+with open(lat, "wb") as f:
+    f.write("ação\n".encode("latin-1"))
+rc, err = travar({"tool_name": "Write", "tool_input": {"file_path": lat, "content": "ação\nmais\n"}})
+ok(rc == 0, "trava v2: arquivo que não é UTF-8 deixa passar e vai para o log")
+t0 = time.time()
+rc, err = travar({"tool_name": "Bash", "tool_input": {"command": f"python -c \"x='{alvo}'\" " + "open(" * 40000}})
+ok(time.time() - t0 < 3, f"trava v2 rápida com 200 KB de open( ({time.time() - t0:.2f} s)")
+t0 = time.time()
+travar({"tool_name": "Bash", "tool_input": {"command": f"sed {alvo} " * 20000}})
+ok(time.time() - t0 < 3, f"trava v2 rápida com 20000 sed ({time.time() - t0:.2f} s)")
+
+# 12. trava v3: casos da rodada 2 da revisão (29/10)
+acres = os.path.join(MEM, "acres.md")
+with open(acres, "w", encoding="utf-8", newline="\n") as f:
+    f.write("---\nname: acres\n---\n\nlinha um\nlinha dois\n")
+for nome, entrada, esperado in [
+    ("Edit que cresce o fim da linha", {"tool_name": "Edit", "tool_input": {"file_path": acres, "old_string": "linha um", "new_string": "linha um extra"}}, 0),
+    ("Edit no name do frontmatter", {"tool_name": "Edit", "tool_input": {"file_path": acres, "old_string": "name: acres", "new_string": "name: acres b"}}, 0),
+    ("Write que cresce uma linha", {"tool_name": "Write", "tool_input": {"file_path": acres, "content": "---\nname: acres\n---\n\nlinha um\nlinha dois extra\n"}}, 0),
+    ("Edit que tira texto (controle)", {"tool_name": "Edit", "tool_input": {"file_path": acres, "old_string": "linha dois", "new_string": "linha 2"}}, 2),
+]:
+    rc, err = travar(entrada)
+    ok(rc == esperado, f"trava v3: {nome} -> {esperado} (deu {rc})")
+alvo_fwd = alvo.replace("\\", "/")
+bloqueiam3 = [
+    ("if/then", "Bash", f'if true; then rm "{alvo}"; fi'),
+    ("chaves", "Bash", f'{{ rm "{alvo}"; }}'),
+    ("subshell", "Bash", f'( rm "{alvo}" )'),
+    ("subshell com cd", "Bash", f'( cd "{MEM}" && rm alvo.md )'),
+    ("negação", "Bash", f'! rm "{alvo}"'),
+    ("while/do", "Bash", f'while true; do rm "{alvo}"; done'),
+    ("for na pasta", "Bash", f'for f in "{MEM}"/*.md; do rm $f; done'),
+    ("python com heredoc", "Bash", f"python - <<'EOF'\nimport os\nos.remove(r'{alvo}')\nEOF"),
+    ("node com heredoc", "Bash", f"node <<'EOF'\nrequire('fs').unlinkSync('{alvo_fwd}')\nEOF"),
+    ("bash com heredoc", "Bash", f"bash <<'EOF'\nrm \"{alvo}\"\nEOF"),
+    ("cp de glob por cima", "Bash", f'cp /tmp/bkp/*.md "{MEM}/"'),
+    ("cp -r de pasta/. por cima", "Bash", f'cp -r /tmp/bkp/. "{MEM}/"'),
+    ("rsync de pasta por cima", "Bash", f'rsync -a /tmp/e/ "{MEM}/"'),
+    ("tar x na pasta", "Bash", f'tar xzf b.tgz -C "{MEM}"'),
+    ("unzip na pasta", "Bash", f'unzip -o b.zip -d "{MEM}"'),
+    ("Copy-Item de glob -Force", "PowerShell", f'Copy-Item bkp\\*.md "{MEM}" -Force'),
+    ("Expand-Archive na pasta", "PowerShell", f'Expand-Archive b.zip -DestinationPath "{MEM}" -Force'),
+    ("$( ) com rm", "Bash", f'echo "$(rm {alvo})"'),
+    ("continuação de linha", "Bash", "rm \\\n" + alvo),
+    ("here-string <<< antes do rm", "Bash", f'cat <<<"hi"\nrm "{alvo}"'),
+    ("aspa escapada antes do rm", "Bash", f"echo l\\'oeil; rm \"{alvo}\""),
+    ("variável apontando para a pasta", "Bash", f'D="{MEM}"; echo x > $D/alvo.md'),
+    ("variável no PowerShell", "PowerShell", f'$f = "{alvo}"; Remove-Item $f'),
+    ("rm depois de 100 KB", "Bash", "echo " + "x" * 110000 + f'\nrm "{alvo}"'),
+    ("ForEach-Object Remove-Item", "PowerShell", f'gci "{MEM}" | ForEach-Object {{ Remove-Item $_.FullName }}'),
+    ("foreach Remove-Item", "PowerShell", f'foreach ($f in gci "{MEM}") {{ Remove-Item $f.FullName }}'),
+    ("Remove-Item -Path @()", "PowerShell", f'Remove-Item -Path @("{alvo}")'),
+    ("xargs sed -i", "Bash", f"ls \"{MEM}\"/*.md | xargs sed -i 's/a/b/'"),
+    ("find -exec sed -i", "Bash", f"find \"{MEM}\" -name \"*.md\" -exec sed -i 's/a/b/' {{}} \\;"),
+    (">| força a sobrescrita", "Bash", f'echo x >| "{alvo}"'),
+]
+for nome, ferramenta, comando in bloqueiam3:
+    rc, err = travar({"tool_name": ferramenta, "tool_input": {"command": comando}})
+    ok(rc == 2, f"trava v3 bloqueia: {nome} (deu {rc})")
+passam3 = [
+    ("> dentro de aspas no echo", "Bash", f'echo "use x > {alvo}"'),
+    ("> dentro de aspas no commit", "Bash", f"git commit -m 'a > {alvo}'"),
+    ("heredoc que só grava um script em /tmp", "Bash", f"cat > /tmp/x.py <<'EOF'\nimport os\nos.remove(r'{alvo}')\nEOF"),
+    ("cp de arquivo novo pelo nome", "Bash", f'cp /tmp/bkp/inexistente-abc.md "{MEM}/inexistente-abc.md"'),
+    ("rsync de um arquivo novo", "Bash", f'rsync -a /tmp/inexistente-abc.md "{MEM}/inexistente-abc.md"'),
+    ("tar listando", "Bash", f'tar tzf "{MEM}/../b.tgz"'),
+]
+for nome, ferramenta, comando in passam3:
+    rc, err = travar({"tool_name": ferramenta, "tool_input": {"command": comando}})
+    ok(rc == 0, f"trava v3 deixa passar: {nome} (deu {rc}) {err[:80]}")
+
+# 13. trava v4: revisão nova de 29/10 (a pasta acima da memória, como a home, não pode travar o trabalho)
+ACIMA = SBX  # no teste, SBX faz o papel da home: contém projects/<projeto>/memory
+HOME_SIM = os.path.dirname(SBX)  # a home real fica acima de ~/.claude (aqui, acima do SBX)
+passam4 = [
+    ("git checkout na pasta acima", "Bash", "git checkout main", HOME_SIM),
+    ("git stash na pasta acima", "Bash", "git stash", HOME_SIM),
+    ("git reset --hard na pasta acima", "Bash", "git reset --hard", HOME_SIM),
+    ("git clean -fd na pasta acima", "Bash", "git clean -fd", HOME_SIM),
+    ("find .pyc -delete na pasta acima", "Bash", "find . -name '*.pyc' -delete", ACIMA),
+    ("find tmp* -delete na pasta acima", "Bash", "find . -maxdepth 1 -name 'tmp*' -delete", ACIMA),
+    ("limpar transcrições -exec rm", "Bash", f"find \"{SBX}/projects\" -name '*.jsonl' -mtime +30 -exec rm {{}} \\;", CWD),
+    ("limpar transcrições -delete", "Bash", f"find \"{SBX}/projects\" -name '*.jsonl' -delete", CWD),
+    ("limpar transcrições | xargs rm", "Bash", f"find \"{SBX}/projects\" -name '*.jsonl' | xargs rm", CWD),
+    ("variável do projeto e rm de subagents", "Bash", f'D="{PROJ_DIR}"; rm -rf $D/subagents', CWD),
+]
+for nome, ferramenta, comando, pasta in passam4:
+    rc, err = travar({"tool_name": ferramenta, "tool_input": {"command": comando}}, cwd=pasta)
+    ok(rc == 0, f"trava v4 deixa passar: {nome} (deu {rc}) {err[:80]}")
+bloqueiam4 = [
+    ("find . -delete sem filtro na pasta acima", "Bash", "find . -delete", ACIMA),
+    ("find .md -delete na pasta acima", "Bash", "find . -name '*.md' -delete", ACIMA),
+    ("if do PowerShell", "PowerShell", f"if ($true) {{ Remove-Item '{alvo}' }}", CWD),
+    ("try do PowerShell", "PowerShell", f"try {{ Remove-Item '{alvo}' -ErrorAction Stop }} catch {{}}", CWD),
+    ("variável listada no PowerShell", "PowerShell", f'$m="{MEM}"; Get-ChildItem $m | Remove-Item', CWD),
+    ("variável com Get-ChildItem", "PowerShell", f"$f=Get-ChildItem '{MEM}'; $f | Remove-Item", CWD),
+    ("cd e Get-ChildItem | Remove-Item", "PowerShell", f"cd '{MEM}'; Get-ChildItem | Remove-Item", CWD),
+    ("cd e ls | xargs rm", "Bash", f'cd "{MEM}" && ls | xargs rm', CWD),
+    ("ls | while read; rm", "Bash", f'ls "{MEM}"/*.md | while read f; do rm "$f"; done', CWD),
+    ("while read < <(ls)", "Bash", f'while read f; do rm $f; done < <(ls "{MEM}"/*.md)', CWD),
+    ("powershell sem -Command", "Bash", f'powershell Remove-Item "{alvo}"', CWD),
+    ("timeout antes do rm", "Bash", f'timeout 5 rm "{alvo}"', CWD),
+    ("nice antes do rm", "Bash", f'nice rm "{alvo}"', CWD),
+    ("eval com rm", "Bash", f"eval 'rm \"{alvo}\"'", CWD),
+    ("python -c relativo de dentro da pasta", "Bash", f'cd "{MEM}" && python -c "import os; os.remove(\'alvo.md\')"', CWD),
+    ("sort -o por cima", "Bash", f'sort -o "{alvo}" "{alvo}"', CWD),
+    ("ruby -i", "Bash", f'ruby -i -pe x "{alvo}"', CWD),
+]
+for nome, ferramenta, comando, pasta in bloqueiam4:
+    rc, err = travar({"tool_name": ferramenta, "tool_input": {"command": comando}}, cwd=pasta)
+    ok(rc == 2, f"trava v4 bloqueia: {nome} (deu {rc})")
+rc, err = travar({"tool_name": "Edit", "tool_input": {"file_path": "\\\\?\\" + acres, "old_string": "linha dois", "new_string": "linha 2"}})
+ok(rc == 2, "trava v4 bloqueia: caminho \\\\?\\ no Edit")
+r = subprocess.run([sys.executable, os.path.join(SCRIPTS, "vigia.py"), "trava"], capture_output=True, cwd=CWD, timeout=20, env=ENV,
+                   input=json.dumps({"tool_name": "Bash", "cwd": 123, "tool_input": {"command": f'rm "{alvo}"'}}).encode())
+ok(r.returncode == 2, "trava v4: cwd que não é texto não libera o rm")
+t0 = time.time()
+travar({"tool_name": "Write", "tool_input": {"file_path": indice, "content": "](a" * 50000}})
+ok(time.time() - t0 < 3, f"trava v4 rápida com ](a x50000 no índice ({time.time() - t0:.2f} s)")
+
+# 14. trava v4.1: rodada 2 da revisão nova (29/10)
+PROJS = os.path.join(SBX, "projects")
+bloqueiam5 = [
+    ("foreach sobre variável que lista memória", "PowerShell", f"$files = Get-ChildItem '{MEM}'; foreach ($f in $files) {{ Remove-Item $f.FullName }}", CWD),
+    ("find ! -name *.jsonl -delete", "Bash", f"find \"{PROJS}\" ! -name '*.jsonl' -delete", CWD),
+    ("find -not -name *.jsonl -delete", "Bash", f"find \"{PROJS}\" -not -name '*.jsonl' -delete", CWD),
+    ("find -name a* -delete", "Bash", f"find \"{PROJS}\" -name 'a*' -delete", CWD),
+    ("find com -o e .md", "Bash", f"find \"{PROJS}\" -not -path '*memory*' -o -name '*.md' -delete", CWD),
+    ("git -C projeto checkout -- memory/x", "Bash", f'git -C "{PROJ_DIR}" checkout -- memory/alvo.md', CWD),
+    ("git clean no projeto", "Bash", f'cd "{PROJ_DIR}" && git clean -fdx', CWD),
+]
+for nome, ferramenta, comando, pasta in bloqueiam5:
+    rc, err = travar({"tool_name": ferramenta, "tool_input": {"command": comando}}, cwd=pasta)
+    ok(rc == 2, f"trava v4.1 bloqueia: {nome} (deu {rc})")
+passam5 = [
+    ("find de pastas vazias", "Bash", f"find \"{PROJS}\" -type d -empty -delete", CWD),
+    ("find *.jsonl com -maxdepth", "Bash", f"find \"{PROJS}\" -maxdepth 2 -name '*.jsonl' -delete", CWD),
+    ("find a* com -maxdepth 1 em projects", "Bash", f"find \"{PROJS}\" -maxdepth 1 -name 'a*' -delete", CWD),
+    ("git checkout main na pasta acima", "Bash", "git checkout main", HOME_SIM),
+]
+for nome, ferramenta, comando, pasta in passam5:
+    rc, err = travar({"tool_name": ferramenta, "tool_input": {"command": comando}}, cwd=pasta)
+    ok(rc == 0, f"trava v4.1 deixa passar: {nome} (deu {rc}) {err[:80]}")
+rc, err = travar({"tool_name": "Bash", "tool_input": {"command": f"find \"{PROJS}\" -maxdepth 3 -name 'a*' -delete"}})
+ok(rc == 2, "trava v4.1 bloqueia: find a* com -maxdepth 3 em projects (alcança a memória)")
+t0 = time.time()
+travar({"tool_name": "Bash", "tool_input": {"command": "echo a\n" * 300000}})
+ok(time.time() - t0 < 5, f"trava v4.1: 2 MB de comando em menos de 5 s ({time.time() - t0:.2f} s)")
+
 log = os.path.join(B, "vigia-erros.log")
 txt_log = open(log, encoding="utf-8").read() if os.path.exists(log) else ""
 ok("PermissionError" not in txt_log, "nenhum PermissionError no log")
