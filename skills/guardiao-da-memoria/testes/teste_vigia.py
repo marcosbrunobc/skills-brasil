@@ -597,6 +597,22 @@ t0 = time.time()
 travar({"tool_name": "Bash", "tool_input": {"command": "echo a\n" * 300000}})
 ok(time.time() - t0 < 5, f"trava v4.1: 2 MB de comando em menos de 5 s ({time.time() - t0:.2f} s)")
 
+# 15. inserção no meio do trecho é acréscimo (bloqueio falso visto ao vivo em 29/10)
+with open(acres, "w", encoding="utf-8", newline="\n") as f:
+    f.write("---\nname: acres\n---\n\nantes do ponto. depois do ponto\n")
+for nome, entrada, esperado in [
+    ("Edit que insere frase no meio do trecho", {"tool_name": "Edit", "tool_input": {"file_path": acres,
+        "old_string": "antes do ponto. depois do ponto", "new_string": "antes do ponto. FRASE NOVA. depois do ponto"}}, 0),
+    ("Write que insere no meio da linha", {"tool_name": "Write", "tool_input": {"file_path": acres,
+        "content": "---\nname: acres\n---\n\nantes do ponto. NOVO. depois do ponto\n"}}, 0),
+    ("Edit que tira uma palavra do meio", {"tool_name": "Edit", "tool_input": {"file_path": acres,
+        "old_string": "antes do ponto. depois do ponto", "new_string": "antes do ponto. do ponto"}}, 2),
+    ("Edit que troca a ordem", {"tool_name": "Edit", "tool_input": {"file_path": acres,
+        "old_string": "antes do ponto. depois do ponto", "new_string": "depois do ponto. antes do ponto"}}, 2),
+]:
+    rc, err = travar(entrada)
+    ok(rc == esperado, f"trava v4.2: {nome} -> {esperado} (deu {rc})")
+
 log = os.path.join(B, "vigia-erros.log")
 txt_log = open(log, encoding="utf-8").read() if os.path.exists(log) else ""
 ok("PermissionError" not in txt_log, "nenhum PermissionError no log")

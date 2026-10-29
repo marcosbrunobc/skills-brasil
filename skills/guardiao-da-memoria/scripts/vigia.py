@@ -988,6 +988,12 @@ def _mantem_linhas(antigo, novo):
     return all(any(l in n for n in restantes) for l in (x.strip() for x in antigo.splitlines()) if l)
 
 
+def _so_insere(antigo, novo):
+    """O texto novo é o antigo com coisas inseridas em qualquer ponto: nenhum caractere antigo sumiu nem mudou de ordem."""
+    resto = iter(novo)
+    return all(c in resto for c in antigo)
+
+
 def _negar(motivo):
     """Código 2 no PreToolUse bloqueia a ferramenta e mostra o stderr ao Claude."""
     sys.stderr.write(
@@ -1035,10 +1041,11 @@ def trava(e):
             _negar("isso tira ou troca um link do MEMORY.md")
         return
     if ferramenta == "Write":
-        if _mantem_linhas(atual, str(entrada.get("content") or "")):
+        novo_texto = str(entrada.get("content") or "")
+        if _mantem_linhas(atual, novo_texto) or _so_insere(atual, novo_texto.replace("\r\n", "\n")):
             return
-    elif pares and all(velho in troca for velho, troca in pares):
-        return  # Edit que só acrescenta: o texto novo contém o antigo
+    elif pares and all(_so_insere(velho, troca) for velho, troca in pares):
+        return  # Edit que só acrescenta: o texto antigo continua inteiro e na ordem dentro do novo
     recente, legivel = _veredito_recente(caminho)
     if recente:
         return
